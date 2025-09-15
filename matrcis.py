@@ -1,0 +1,198 @@
+import numpy as np
+import os
+import torch 
+from batchgenerators.utilities.file_and_folder_operations import subfiles, join, save_json, load_json, isfile
+import SimpleITK as sitk
+import multiprocessing
+from copy import deepcopy
+import matplotlib.pyplot as plt
+
+def load_segmentation(segmentation_path):
+    seg = sitk.ReadImage(segmentation_path)
+    npy_image = sitk.GetArrayFromImage(seg)
+    if npy_image.ndim == 2:
+        npy_image = npy_image[None, None]
+    elif npy_image.ndim == 3:
+        npy_image = npy_image[None]
+    elif npy_image.ndim == 4:
+        pass
+    return npy_image.astype(np.float16)
+
+def region_or_label_to_mask(segmentation: np.ndarray, region_or_label) -> np.ndarray:
+    if np.isscalar(region_or_label):
+        return segmentation == region_or_label
+    else:
+        mask = np.zeros_like(segmentation, dtype=bool)
+        for r in region_or_label:
+            mask[segmentation == r] = True
+    return mask
+
+def compute_tp_fp_fn_tn(mask_ref: np.ndarray, mask_pred: np.ndarray, ignore_mask: np.ndarray = None):
+    if ignore_mask is None:
+        use_mask = np.ones_like(mask_ref, dtype=bool)
+    else:
+        use_mask = ~ignore_mask
+    tp = np.sum((mask_ref & mask_pred) & use_mask)
+    fp = np.sum(((~mask_ref) & mask_pred) & use_mask)
+    fn = np.sum((mask_ref & (~mask_pred)) & use_mask)
+    tn = np.sum(((~mask_ref) & (~mask_pred)) & use_mask)
+    return tp, fp, fn, tn
+
+
+def compute_metrics(reference_file: str, prediction_file: str,
+                    labels_or_regions,folder_path:str,
+                    ignore_label: int = None, per_slice: bool=False) -> dict:
+    # load images
+    print("Loading segmentation from:", reference_file.split("/")[-1])
+    seg_ref = load_segmentation(reference_file)
+    seg_pred= load_segmentation(prediction_file)
+
+    ignore_mask = seg_ref == ignore_label if ignore_label is not None else None
+
+    results = {}
+    results['reference_file'] = reference_file
+    results['prediction_file'] = prediction_file
+    results['metrics'] = {}
+    for r in labels_or_regions:
+        results['metrics'][r] = {}
+        mask_ref = region_or_label_to_mask(seg_ref, r)
+        mask_pred = region_or_label_to_mask(seg_pred, r)
+
+        if per_slice:
+            dice_scores = []
+            iou_scores = []
+            img_dimensions = mask_ref.shape[1]
+            
+            for dim in range(img_dimensions):
+                tp, fp, fn, tn = compute_tp_fp_fn_tn(mask_ref[:,dim,:,:], mask_pred[:,dim,:,:], ignore_mask[:,dim,:,:] if ignore_mask is not None else None)
+                if tp + fp + fn == 0:
+                    dice = np.nan
+                    iou = np.nan
+                else:
+                    dice = 2 * tp / (2 * tp + fp + fn)
+                    iou = tp / (tp + fp + fn)
+                dice_scores.append(dice)
+                iou_scores.append(iou)
+            # print(len(dice_scores), len(iou_scores))
+            results['metrics'][r]['Dice_through_z_axis'] = str(dice_scores)
+            results['metrics'][r]['IoU_through_z_axis'] = str(iou_scores)
+            # save the plots
+            plt.figure(figsize=(12, 6))
+            plt.plot(dice_scores, label='Dice Score', marker='.')
+            plt.plot(iou_scores, label='IoU', marker='.')
+            plt.title(f'Metrics through Z-axis for label {r} of {reference_file.split("/")[-1].split("_")[2].split(".")[0]}')
+            plt.xlabel('Slice Index')
+            plt.ylabel('Metric Value')
+            plt.ylim(0, 1)
+            plt.savefig(os.path.join(folder_path,"Eval_plots",f'{reference_file.split("/")[-1].split("_")[2].split(".")[0]}_{r}.png'))
+
+        tp, fp, fn, tn = compute_tp_fp_fn_tn(mask_ref, mask_pred, ignore_mask)
+        if tp + fp + fn == 0:
+            results['metrics'][r]['Dice'] = np.nan
+            results['metrics'][r]['IoU'] = np.nan
+        else:
+            results['metrics'][r]['Dice'] = 2 * tp / (2 * tp + fp + fn)
+            results['metrics'][r]['IoU'] = tp / (tp + fp + fn)
+        results['metrics'][r]['FP'] = fp
+        results['metrics'][r]['TP'] = tp
+        results['metrics'][r]['FN'] = fn
+        results['metrics'][r]['TN'] = tn
+        results['metrics'][r]['n_pred'] = fp + tp
+        results['metrics'][r]['n_ref'] = fn + tp
+        print("Metrics are Calculated")
+    return results
+
+
+def save_summary_json(results: dict, output_file: str):
+    """
+    stupid json does not support tuples as keys (why does it have to be so shitty) so we need to convert that shit
+    ourselves
+    """
+    results_converted = deepcopy(results)
+    # convert keys in mean metrics
+    results_converted['mean'] = {str(k): results['mean'][k] for k in results['mean'].keys()}
+    # convert metric_per_case
+    for i in range(len(results_converted["metric_per_case"])):
+        results_converted["metric_per_case"][i]['metrics'] = \
+            {str(k): {metric:np.float64(results["metric_per_case"][i]['metrics'][k][metric])\
+                      if metric!= 'Dice_through_z_axis'and metric!= 'IoU_through_z_axis' else results["metric_per_case"][i]['metrics'][k][metric]\
+                        for metric in results["metric_per_case"][i]['metrics'][k].keys()}
+             for k in results["metric_per_case"][i]['metrics'].keys()}
+    # sort_keys=True will make foreground_mean the first entry and thus easy to spot
+    save_json(results_converted, output_file, sort_keys=True)
+
+
+def compute_metrics_on_folder(folder_ref: str, folder_pred: str, output_file: str,
+                              per_slice,
+                              file_ending,
+                              regions_or_labels,
+                              ignore_label: int = None,
+                              num_processes: int = 8,
+                              chill: bool = True) -> dict:
+    
+    if output_file is not None:
+        assert output_file.endswith('.json'), 'output_file should end with .json'
+    files_pred = subfiles(folder_pred, suffix=file_ending, join=False)
+    files_ref = subfiles(folder_ref, suffix=file_ending, join=False)
+    if not chill:
+        present = [isfile(join(folder_pred, i)) for i in files_ref]
+        assert all(present), "Not all files in folder_pred exist in folder_ref"
+    files_ref = [join(folder_ref, i) for i in files_pred]
+    files_pred = [join(folder_pred, i) for i in files_pred]
+    
+    with multiprocessing.get_context("spawn").Pool(num_processes) as pool:
+        results = pool.starmap(
+            compute_metrics,
+            list(zip(files_ref, files_pred, [regions_or_labels] * len(files_pred),[folder_pred]*len(files_pred),
+                     [ignore_label] * len(files_pred), [per_slice] * len(files_pred)))
+        )
+
+    # mean metric per class
+    metric_list = list(results[0]['metrics'][regions_or_labels[0]].keys())
+    if per_slice:
+        metric_list.remove('Dice_through_z_axis')
+        metric_list.remove('IoU_through_z_axis')
+        
+    means = {}
+    for r in regions_or_labels:
+        means[r] = {}
+        for m in metric_list:
+            means[r][m] = np.nanmean([i['metrics'][r][m] for i in results])
+
+    # foreground mean
+    foreground_mean = {}
+    for m in metric_list:
+        values = []
+        for k in means.keys():
+            if k == 0 or k == '0':
+                continue
+            values.append(means[k][m])
+        foreground_mean[m] = np.mean(values)
+
+   
+    result = {'metric_per_case': results, 'mean': means, 'foreground_mean': foreground_mean}
+    print("Metrics computed for all files.")
+    if output_file is not None:
+        save_summary_json(result, output_file)
+    else:
+        print("No output file specified, not saving results.")
+
+if __name__ == "__main__":
+
+    Val_Folder = "/home/cellsmb/Desktop/Dinuka/Image_Analysis/Model_results/Model_results/IF_352_6img_results/all_segs_bg"
+    GT_Folder = "/home/cellsmb/Desktop/Dinuka/Image_Analysis/nnUnet_raw/labelsTr"
+
+    if not os.path.exists(os.path.join(Val_Folder,"Eval_plots")):
+        os.mkdir(os.path.join(Val_Folder,"Eval_plots"))
+        
+    compute_metrics_on_folder(
+        folder_pred=Val_Folder,
+        folder_ref=GT_Folder,
+        output_file=join(Val_Folder, "Evaluation_summary_perslice.json"),
+        per_slice=True,
+        file_ending=".nii.gz",
+        regions_or_labels=[1, 2, 3, 4,5],
+        ignore_label=None,
+        num_processes=8,
+        chill=True
+    )
