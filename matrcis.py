@@ -43,10 +43,9 @@ def compute_metrics(reference_file: str, prediction_file: str,
                     labels_or_regions,folder_path:str,
                     ignore_label: int = None, per_slice: bool=False) -> dict:
     # load images
-    print("Loading segmentation from:", reference_file.split("/")[-1])
     seg_ref = load_segmentation(reference_file)
     seg_pred= load_segmentation(prediction_file)
-
+    label_names = ['background',"Myocardium","Endocardium","Lumen","ECM"]
     ignore_mask = seg_ref == ignore_label if ignore_label is not None else None
 
     results = {}
@@ -74,17 +73,18 @@ def compute_metrics(reference_file: str, prediction_file: str,
                 dice_scores.append(dice)
                 iou_scores.append(iou)
             # print(len(dice_scores), len(iou_scores))
-            results['metrics'][r]['Dice_through_z_axis'] = str(dice_scores)
-            results['metrics'][r]['IoU_through_z_axis'] = str(iou_scores)
+            results['metrics'][r]['Dice_through_z_axis'] = dice_scores
+            results['metrics'][r]['IoU_through_z_axis'] = iou_scores
             # save the plots
-            plt.figure(figsize=(12, 6))
-            plt.plot(dice_scores, label='Dice Score', marker='.')
-            plt.plot(iou_scores, label='IoU', marker='.')
-            plt.title(f'Metrics through Z-axis for label {r} of {reference_file.split("/")[-1].split("_")[2].split(".")[0]}')
-            plt.xlabel('Slice Index')
-            plt.ylabel('Metric Value')
-            plt.ylim(0, 1)
-            plt.savefig(os.path.join(folder_path,"Eval_plots",f'{reference_file.split("/")[-1].split("_")[2].split(".")[0]}_{r}.png'))
+            # plt.figure(figsize=(12, 6))
+            # plt.plot(dice_scores, label='Dice Score', marker='.')
+            # plt.plot(iou_scores, label='IoU', marker='.')
+            # plt.title(f'{label_names[r-1]} of {reference_file.split("/")[-1].split("_")[2].split(".")[0]}')
+            # plt.xlabel('Slice Index')
+            # plt.ylabel('Metric Value')
+            # plt.ylim(0, 1)
+            # plt.legend()
+            # plt.savefig(os.path.join(folder_path,"Eval_plots",f'{reference_file.split("/")[-1].split("_")[2].split(".")[0]}_{r}.png'))
 
         tp, fp, fn, tn = compute_tp_fp_fn_tn(mask_ref, mask_pred, ignore_mask)
         if tp + fp + fn == 0:
@@ -99,7 +99,6 @@ def compute_metrics(reference_file: str, prediction_file: str,
         results['metrics'][r]['TN'] = tn
         results['metrics'][r]['n_pred'] = fp + tp
         results['metrics'][r]['n_ref'] = fn + tp
-        print("Metrics are Calculated")
     return results
 
 
@@ -169,9 +168,48 @@ def compute_metrics_on_folder(folder_ref: str, folder_pred: str, output_file: st
             values.append(means[k][m])
         foreground_mean[m] = np.mean(values)
 
-   
+    label_names = ['background',"Myocardium","Endocardium","Lumen","ECM"]
+    start_end = {'1':[23,549],'2':[0,697],'3':[21,317],'4':[30,375],'5':[13,367],'6':[19,595]}
+
+    for ID,label in enumerate(regions_or_labels):
+        Dice=[]
+        IoU=[]
+        max_length =0
+        img_IDs=[]
+        for imgs in results:
+            Dice.append(imgs['metrics'][label]['Dice_through_z_axis'])
+            IoU.append(imgs['metrics'][label]['IoU_through_z_axis'])
+            max_length = max(max_length,len(imgs['metrics'][label]['Dice_through_z_axis']))
+            img_IDs.append(imgs['reference_file'].split("/")[-1].split("_")[2].split(".")[0])
+        
+        fig1,ax1 = plt.subplots(figsize=(15,10))
+        fig2,ax2 = plt.subplots(figsize=(15,10))
+        
+        for r in range(len(Dice)):
+            n = len(Dice[r])
+            offset = (max_length - n) // 2
+            x = np.arange(offset, offset + n)  # center the shorter curve
+            ax1.plot(x,Dice[r], marker='.',label=f'Image {img_IDs[r]}')
+            ax1.scatter([offset+start_end[str(int(img_IDs[r]))][0], offset+start_end[str(int(img_IDs[r]))][1]], \
+                        [Dice[r][start_end[str(int(img_IDs[r]))][0]],Dice[r][start_end[str(int(img_IDs[r]))][1]]], color='black', s=100)
+            
+            ax2.plot(x,IoU[r], marker='.',label=f'Image {img_IDs[r]}')
+            ax2.scatter([offset+start_end[str(int(img_IDs[r]))][0], offset+start_end[str(int(img_IDs[r]))][1]], \
+                        [IoU[r][start_end[str(int(img_IDs[r]))][0]],IoU[r][start_end[str(int(img_IDs[r]))][1]]], color='black', s=100)
+        ax1.set_title(f'Dice through z-axis for {label_names[ID]}')
+        ax1.set_xlabel('Z-axis (slices)')
+        ax1.set_ylabel('Dice Score')
+        ax1.legend()
+        ax2.set_title(f'IoU through z-axis for {label_names[ID]}')
+        ax2.set_xlabel('Z-axis (slices)')
+        ax2.set_ylabel('IoU Score')
+        ax2.legend()
+        fig1.savefig(os.path.join(folder_pred,"Eval_plots",f'All_Dice_IoU_through_z_axis_label_{label}.png'))
+        fig2.savefig(os.path.join(folder_pred,"Eval_plots",f'All_IoU_through_z_axis_label_{label}.png'))
+        plt.close(fig1)
+        plt.close(fig2)
+
     result = {'metric_per_case': results, 'mean': means, 'foreground_mean': foreground_mean}
-    print("Metrics computed for all files.")
     if output_file is not None:
         save_summary_json(result, output_file)
     else:
