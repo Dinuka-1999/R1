@@ -209,8 +209,8 @@ def compute_metrics_on_folder(folder_ref: str, folder_pred: str, output_file: st
         ax2.set_xlabel('Z-axis (slices)')
         ax2.set_ylabel('IoU Score')
         ax2.legend()
-        fig1.savefig(os.path.join(folder_pred,"Eval_plots",f'All_Dice_IoU_through_z_axis_label_{label}.png'), dpi=300)
-        fig2.savefig(os.path.join(folder_pred,"Eval_plots",f'All_IoU_through_z_axis_label_{label}.png'), dpi=300)
+        fig1.savefig(os.path.join(folder_pred,"Eval_plots",f'All_Dice_IoU_through_z_axis_label_{label}.pdf'), dpi=300)
+        fig2.savefig(os.path.join(folder_pred,"Eval_plots",f'All_IoU_through_z_axis_label_{label}.pdf'), dpi=300)
         plt.close(fig1)
         plt.close(fig2)
 
